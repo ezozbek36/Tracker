@@ -11,7 +11,7 @@
 
 use proc_macro::{self, Span, TokenStream};
 use proc_macro2::{Span as Span2, TokenStream as TokenStream2};
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{format_ident, quote, quote_spanned, ToTokens};
 use syn::{
     parse_macro_input, Attribute, Error, Field, Fields, GenericParam, Ident, ItemStruct, Type,
 };
@@ -86,6 +86,7 @@ pub fn track(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut output = data.to_token_stream();
 
     let mut methods = proc_macro2::TokenStream::new();
+    let mut trait_methods = proc_macro2::TokenStream::new();
     for (num, (id, ty, no_eq, vis)) in field_list.iter().enumerate() {
         let id_span: Span2 = id.span().unwrap().into();
 
@@ -103,38 +104,50 @@ pub fn track(attr: TokenStream, item: TokenStream) -> TokenStream {
         let changed_doc = format!("Check if value of {id} field has changed.");
         let bit_mask_doc = format!("Get a bit mask to look for changes on the {id} field.");
 
-        methods.extend(quote_spanned! { id_span =>
+        trait_methods.extend(quote_spanned! { id_span =>
             #[allow(dead_code, non_snake_case)]
             #[must_use]
             #[doc = #get_doc]
-            #vis fn #get_id(&self) -> &#ty {
-                &self.#id
-            }
+            #vis fn #get_id(&self) -> &#ty;
 
             #[allow(dead_code, non_snake_case)]
             #[must_use]
             #[doc = #get_mut_doc]
+            #vis fn #get_mut_id(&mut self) -> &mut #ty;
+
+            #[allow(dead_code, non_snake_case)]
+            #[doc = #update_doc]
+            #vis fn #update_id<F>(&mut self, f: F) where F: FnOnce(&mut #ty);
+
+            #[allow(dead_code, non_snake_case)]
+            #[doc = #changed_doc]
+            #vis fn #changed_id(&self) -> bool;
+
+            #[allow(dead_code, non_snake_case)]
+            #[must_use]
+            #[doc = #bit_mask_doc]
+            #vis fn #id() -> #tracker_ty;
+        });
+
+        methods.extend(quote_spanned! { id_span =>
+            #vis fn #get_id(&self) -> &#ty {
+                &self.#id
+            }
+
             #vis fn #get_mut_id(&mut self) -> &mut #ty {
                 self.tracker |= Self::#id();
                 &mut self.#id
             }
 
-            #[allow(dead_code, non_snake_case)]
-            #[doc = #update_doc]
-            #vis fn #update_id<F: FnOnce(&mut #ty)>(&mut self, f: F) {
+            #vis fn #update_id<F>(&mut self, f: F) where F: FnOnce(&mut #ty) {
                 self.tracker |= Self::#id();
                 f(&mut self.#id);
             }
 
-            #[allow(dead_code, non_snake_case)]
-            #[doc = #changed_doc]
             #vis fn #changed_id(&self) -> bool {
                 self.changed(Self::#id())
             }
 
-            #[allow(dead_code, non_snake_case)]
-            #[must_use]
-            #[doc = #bit_mask_doc]
             #vis fn #id() -> #tracker_ty {
                 1 << #num
             }
@@ -142,9 +155,12 @@ pub fn track(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         if *no_eq {
             let set_doc = format!("Set the value of field {id} and mark the field as changed.");
-            methods.extend(quote_spanned! { id_span =>
+            trait_methods.extend(quote_spanned! { id_span =>
                 #[allow(dead_code, non_snake_case)]
                 #[doc = #set_doc]
+                #vis fn #set_id(&mut self, value: #ty);
+            });
+            methods.extend(quote_spanned! { id_span =>
                 #vis fn #set_id(&mut self, value: #ty) {
                     self.tracker |= Self::#id();
                     self.#id = value;
@@ -152,9 +168,12 @@ pub fn track(attr: TokenStream, item: TokenStream) -> TokenStream {
             });
         } else {
             let set_doc = format!("Set the value of field {id} and mark the field as changed if it's not equal to the previous value.");
-            methods.extend(quote_spanned! { id_span =>
+            trait_methods.extend(quote_spanned! { id_span =>
                 #[allow(dead_code, non_snake_case)]
                 #[doc = #set_doc]
+                #vis fn #set_id(&mut self, value: #ty);
+            });
+            methods.extend(quote_spanned! { id_span =>
                 #vis fn #set_id(&mut self, value: #ty) {
                     if self.#id != value {
                         self.tracker |= Self::#id();
@@ -165,21 +184,19 @@ pub fn track(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    output.extend(quote_spanned! { ident.span() =>
-        impl #generics #ident < #generic_idents > #where_clause {
-            #methods
+    let trait_ident = format_ident!("{}Tracker", ident);
+
+    output.extend(quote_spanned! { trait_ident.span() =>
+        trait #trait_ident < #generic_idents > #where_clause {
+            #trait_methods
             #[allow(dead_code)]
             #[must_use]
             /// Get a bit mask to look for changes on all fields.
-            #struct_vis fn track_all() -> #tracker_ty {
-                #tracker_ty::MAX
-            }
+            #struct_vis fn track_all() -> #tracker_ty;
 
             #[allow(dead_code)]
             /// Mark all fields of the struct as changed.
-            #struct_vis fn mark_all_changed(&mut self) {
-                self.tracker = #tracker_ty::MAX;
-            }
+            #struct_vis fn mark_all_changed(&mut self);
 
             /// Check for changes made to this struct with a given bitmask.
             ///
@@ -187,20 +204,40 @@ pub fn track(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// or `Type::#track_all()`.
             #[warn(dead_code)]
             #[must_use]
-            #struct_vis fn changed(&self, mask: #tracker_ty) -> bool {
-                self.tracker & mask != 0
-            }
+            #struct_vis fn changed(&self, mask: #tracker_ty) -> bool;
 
             /// Check for any changes made to this struct.
             #[allow(dead_code)]
             #[must_use]
-            #struct_vis fn changed_any(&self) -> bool {
-                self.tracker != 0
-            }
+            #struct_vis fn changed_any(&self) -> bool;
 
             /// Resets the tracker value of this struct to mark all fields
             /// as unchanged again.
             #[warn(dead_code)]
+            #struct_vis fn reset(&mut self);
+        }
+    });
+
+    output.extend(quote_spanned! { ident.span() =>
+        impl #generics #trait_ident < #generic_idents > for #ident < #generic_idents > #where_clause {
+            #methods
+
+            #struct_vis fn track_all() -> #tracker_ty {
+                #tracker_ty::MAX
+            }
+
+            #struct_vis fn mark_all_changed(&mut self) {
+                self.tracker = #tracker_ty::MAX;
+            }
+
+            #struct_vis fn changed(&self, mask: #tracker_ty) -> bool {
+                self.tracker & mask != 0
+            }
+
+            #struct_vis fn changed_any(&self) -> bool {
+                self.tracker != 0
+            }
+
             #struct_vis fn reset(&mut self) {
                 self.tracker = 0;
             }
